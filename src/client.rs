@@ -27,6 +27,7 @@ use tokio::{
     time::{self, Instant},
 };
 use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message as WebSocketMessage};
+use tracing::{debug, error, info, trace, warn};
 
 enum Event {
     Accepted {
@@ -70,6 +71,7 @@ const MAX_POST_EVENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TOTAL_LOCAL_WRITE_BYTES: usize = 64 * 1024 * 1024;
 const TRANSPORT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[tracing::instrument(skip(config), fields(transport = %config.kind, user = %config.client_user))]
 pub async fn run(config: Config) -> Result<()> {
     let (events_tx, mut events_rx) = mpsc::channel(4096);
     let (outbound_tx, outbound_rx) = mpsc::channel(4096);
@@ -121,7 +123,7 @@ pub async fn run(config: Config) -> Result<()> {
         let listener = TcpListener::bind(address)
             .await
             .with_context(|| format!("bind local forward {address}"))?;
-        eprintln!(
+        info!(
             "forward listening on {} -> {}:{}",
             listener.local_addr()?,
             forward.remote_host,
@@ -178,15 +180,13 @@ pub async fn run(config: Config) -> Result<()> {
     let mut pending_data: HashMap<i32, Vec<Vec<u8>>> = HashMap::new();
     let global_write_budget = Arc::new(Semaphore::new(MAX_TOTAL_LOCAL_WRITE_BYTES));
 
-    eprintln!(
-        "connecting to Java hppt server using {} transport",
-        config.kind
-    );
+    info!(transport = %config.kind, "starting Java hppt transport");
 
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal.context("listen for Ctrl-C")?;
+                info!("shutdown requested by Ctrl-C");
                 break;
             }
             event = events_rx.recv() => {
@@ -198,10 +198,16 @@ pub async fn run(config: Config) -> Result<()> {
                         if pending_accepts.len() + pending_sessions.len()
                             >= MAX_PENDING_LOCAL_CONNECTIONS
                         {
-                            eprintln!("too many pending local connections; rejecting port {port}");
+                            warn!(
+                                local_port = port,
+                                pending = pending_accepts.len() + pending_sessions.len(),
+                                "pending local connection limit reached; rejecting connection"
+                            );
                             drop(stream);
                             continue;
                         }
+                        let peer = stream.peer_addr().ok();
+                        debug!(local_port = port, ?peer, "accepted local TCP connection");
                         pending_accepts.push_back((port, stream));
                         if state.logged_in {
                             send_pending_accepts(
@@ -214,6 +220,7 @@ pub async fn run(config: Config) -> Result<()> {
                     }
                     Event::LocalData { generation, session_id, bytes } => {
                         if generation == state.generation {
+                            trace!(session_id, bytes = bytes.len(), "read local TCP data");
                             state.session_bytes.push_back(SessionBytes { session_id, bytes });
                         }
                     }
@@ -229,12 +236,15 @@ pub async fn run(config: Config) -> Result<()> {
                         if existed && state.logged_in {
                             state.commands.push_back(format!("1{session_id}"));
                         }
+                        if existed {
+                            debug!(session_id, "local TCP session closed");
+                        }
                     }
                     Event::LocalWriteFailed { generation, session_id, reason } => {
                         if generation != state.generation {
                             continue;
                         }
-                        eprintln!("local session {session_id} write failed: {reason}");
+                        warn!(session_id, %reason, "write to local TCP session failed");
                         let existed = writers.remove(&session_id).is_some();
                         if let Some(task) = reader_tasks.remove(&session_id) {
                             task.abort();
@@ -258,7 +268,7 @@ pub async fn run(config: Config) -> Result<()> {
                             if state.logged_in {
                                 last_server_heartbeat = Instant::now();
                                 restart_requested = false;
-                                eprintln!("logged in as {}", config.client_user);
+                                info!(user = %config.client_user, "authenticated with Java server");
                                 send_pending_accepts(
                                     &config,
                                     &mut pending_accepts,
@@ -288,7 +298,11 @@ pub async fn run(config: Config) -> Result<()> {
                         for data in message.sessions {
                             if let Some(writer) = writers.get(&data.session_id) {
                                 if let Err(error) = writer.try_write(data.bytes) {
-                                    eprintln!("local session {} write queue failed: {error}", data.session_id);
+                                    warn!(
+                                        session_id = data.session_id,
+                                        %error,
+                                        "local TCP write queue failed; closing session"
+                                    );
                                     writers.remove(&data.session_id);
                                     if let Some(task) = reader_tasks.remove(&data.session_id) {
                                         task.abort();
@@ -302,9 +316,10 @@ pub async fn run(config: Config) -> Result<()> {
                                     > MAX_PENDING_SESSION_BYTES
                                     || chunks.len() >= MAX_PENDING_SESSION_CHUNKS
                                 {
-                                    eprintln!(
-                                        "discarding oversized pre-init data for session {}",
-                                        data.session_id
+                                    warn!(
+                                        session_id = data.session_id,
+                                        queued_chunks = chunks.len(),
+                                        "discarding pre-initialization data over queue limit"
                                     );
                                     pending_data.remove(&data.session_id);
                                     state.commands.push_back(format!("1{}", data.session_id));
@@ -315,7 +330,7 @@ pub async fn run(config: Config) -> Result<()> {
                         }
                     }
                     Event::TransportReset { generation, reason } => {
-                        eprintln!("transport disconnected: {reason}; reconnecting");
+                        warn!(%reason, generation, "transport disconnected; resetting sessions");
                         pending_accepts.extend(pending_sessions.drain().map(|(_, (port, stream))| (port, stream)));
                         for task in reader_tasks.drain().map(|(_, task)| task) {
                             task.abort();
@@ -325,7 +340,10 @@ pub async fn run(config: Config) -> Result<()> {
                         state.reset_for_transport(generation);
                         restart_requested = false;
                     }
-                    Event::Fatal(error) => return Err(error).context("background client task failed"),
+                    Event::Fatal(error) => {
+                        error!(error = %error, "background client task failed");
+                        return Err(error).context("background client task failed");
+                    }
                 }
             }
             _ = send_tick.tick() => {
@@ -339,6 +357,11 @@ pub async fn run(config: Config) -> Result<()> {
                         bytes
                     };
                     outbound_tx.send(bytes).await.context("queue client protocol message")?;
+                    trace!(
+                        command_count = message.commands.len(),
+                        session_count = message.sessions.len(),
+                        "queued encrypted client protocol message"
+                    );
                 }
             }
             _ = heartbeat_tick.tick(), if config.heartbeat_period > 0 && state.logged_in => {
@@ -346,6 +369,10 @@ pub async fn run(config: Config) -> Result<()> {
                     && !restart_requested
                 {
                     restart_requested = true;
+                    warn!(
+                        elapsed_ms = last_server_heartbeat.elapsed().as_millis(),
+                        "Java server heartbeat timed out; restarting transport"
+                    );
                     let _ = restart_tx.send("server heartbeat timeout".to_owned());
                 } else {
                     state.commands.push_back(format!("3:{}", unix_time_millis()));
@@ -354,7 +381,7 @@ pub async fn run(config: Config) -> Result<()> {
         }
     }
 
-    eprintln!("shutting down local forwards");
+    info!("local forwards stopped");
     Ok(())
 }
 
@@ -453,13 +480,14 @@ async fn process_handshake(
             state.cipher = Some(cipher);
             state.login_sent = true;
             state.login_attempts = 1;
-            eprintln!("time synchronized with Java server (offset {dt} ms)");
+            info!(clock_offset_ms = dt, "synchronized clock with Java server");
         }
         "login" if parameter == "0" => {
             if !state.login_sent {
                 bail!("Java server acknowledged login before a login request was sent");
             }
             state.logged_in = true;
+            info!("Java server accepted login");
         }
         "login" => {
             if state.login_attempts >= 2 {
@@ -477,8 +505,9 @@ async fn process_handshake(
                 .context("queue login retry")?;
             state.cipher = Some(cipher);
             state.login_attempts += 1;
-            eprintln!(
-                "Java server rejected the first login attempt; retrying with a fresh time key"
+            warn!(
+                rejection_code = parameter,
+                "Java server rejected first login attempt; retrying with a fresh time key"
             );
         }
         other => bail!("unexpected Java handshake command {other:?}"),
@@ -526,6 +555,7 @@ fn process_server_command(
             let session_id: i32 = session.parse().context("invalid session id")?;
             let flag: u32 = flag.parse().context("invalid session init flag")?;
             if let Some((_, stream)) = ctx.pending_sessions.remove(&flag) {
+                let local_peer = stream.peer_addr().ok();
                 let (reader, writer) = stream.into_split();
                 ctx.writers.insert(
                     session_id,
@@ -548,12 +578,23 @@ fn process_server_command(
                         state.max_send_body_size.min(16 * 1024),
                     ),
                 );
+                info!(
+                    session_id,
+                    init_flag = flag,
+                    ?local_peer,
+                    "Java server initialized local TCP session"
+                );
                 if let Some(chunks) = ctx.pending_data.remove(&session_id)
                     && let Some(writer) = ctx.writers.get(&session_id)
                 {
+                    debug!(
+                        session_id,
+                        queued_chunks = chunks.len(),
+                        "flushing pre-initialization data to local session"
+                    );
                     for chunk in chunks {
                         if let Err(error) = writer.try_write(chunk) {
-                            eprintln!("local session {session_id} queued write failed: {error}");
+                            warn!(session_id, %error, "queued local TCP write failed");
                             ctx.writers.remove(&session_id);
                             if let Some(task) = ctx.reader_tasks.remove(&session_id) {
                                 task.abort();
@@ -564,7 +605,11 @@ fn process_server_command(
                     }
                 }
             } else {
-                eprintln!("server initialized unknown local connection flag {flag}");
+                warn!(
+                    session_id,
+                    init_flag = flag,
+                    "Java server initialized an unknown local connection"
+                );
                 state.commands.push_back(format!("1{session_id}"));
             }
         }
@@ -580,13 +625,17 @@ fn process_server_command(
         }
         "2" => {
             let session_id: i32 = parameter.parse().context("invalid close-session id")?;
-            ctx.writers.remove(&session_id);
+            let existed = ctx.writers.remove(&session_id).is_some();
             if let Some(task) = ctx.reader_tasks.remove(&session_id) {
                 task.abort();
             }
             ctx.pending_data.remove(&session_id);
+            debug!(session_id, existed, "Java server closed TCP session");
         }
-        "3" => *ctx.last_server_heartbeat = Instant::now(),
+        "3" => {
+            *ctx.last_server_heartbeat = Instant::now();
+            trace!("received Java server heartbeat");
+        }
         other => bail!("unknown Java server command {other:?}"),
     }
     Ok(())
@@ -688,7 +737,10 @@ fn send_pending_accepts(
             .iter()
             .find(|forward| forward.local_port == port)
         else {
-            eprintln!("accepted connection for unconfigured local port {port}");
+            warn!(
+                local_port = port,
+                "accepted connection has no matching forward configuration"
+            );
             continue;
         };
         state.next_init_flag = state.next_init_flag.wrapping_add(1).max(1);
@@ -696,6 +748,13 @@ fn send_pending_accepts(
         let command = format!(
             "0{},{},{}",
             forward.remote_host, forward.remote_port, init_flag
+        );
+        info!(
+            local_port = port,
+            remote_host = %forward.remote_host,
+            remote_port = forward.remote_port,
+            init_flag,
+            "requesting remote TCP session"
         );
         pending_sessions.insert(init_flag, (port, stream));
         state.commands.push_back(command);
@@ -714,6 +773,7 @@ fn start_local_reader(
         loop {
             match reader.read(&mut buffer).await {
                 Ok(0) => {
+                    debug!(session_id, "local TCP peer closed connection");
                     let _ = events_tx
                         .send(Event::LocalClosed {
                             generation,
@@ -723,6 +783,7 @@ fn start_local_reader(
                     return;
                 }
                 Ok(size) => {
+                    trace!(session_id, bytes = size, "read bytes from local TCP peer");
                     if events_tx
                         .send(Event::LocalData {
                             generation,
@@ -736,7 +797,7 @@ fn start_local_reader(
                     }
                 }
                 Err(error) => {
-                    eprintln!("local session {session_id} read failed: {error}");
+                    warn!(session_id, %error, "failed to read from local TCP peer");
                     let _ = events_tx
                         .send(Event::LocalClosed {
                             generation,
@@ -775,6 +836,7 @@ fn start_post_transport(
         loop {
             while outbound_rx.try_recv().is_ok() {}
             let cookie = uuid_string();
+            info!(generation, "connecting to POST transport");
             let result = run_post_generation(
                 &client,
                 &mut outbound_rx,
@@ -814,7 +876,12 @@ fn start_post_transport(
             {
                 return;
             }
-            eprintln!("POST transport attempt {failure_count} failed; retrying in {delay} ms");
+            warn!(
+                attempt = failure_count,
+                retry_delay_ms = delay,
+                error = %error,
+                "POST transport failed; retrying"
+            );
             time::sleep(Duration::from_millis(delay)).await;
         }
     });
@@ -902,6 +969,11 @@ async fn post_send_loop(
             messages.push(bytes);
         }
         let body = encode_bytes_list(&messages);
+        debug!(
+            frame_count = messages.len(),
+            batch_bytes = batch_size,
+            "sending POST protocol batch"
+        );
         let mut response = client
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
@@ -913,6 +985,7 @@ async fn post_send_loop(
         if !status.is_success() {
             bail!("POST /s returned HTTP {status}");
         }
+        trace!(%status, "POST sender request completed");
         if response
             .chunk()
             .await
@@ -946,7 +1019,13 @@ async fn post_receive_loop(
         }
         let body = read_bounded_response(response).await?;
         if !body.is_empty() {
-            for frame in decode_bytes_list(&body).context("decode Java BytesListPb")? {
+            let frames = decode_bytes_list(&body).context("decode Java BytesListPb")?;
+            debug!(
+                frame_count = frames.len(),
+                response_bytes = body.len(),
+                "received POST protocol batch"
+            );
+            for frame in frames {
                 if frame.len() > MAX_SERVER_FRAME_BYTES {
                     bail!("Java server frame exceeds {} bytes", MAX_SERVER_FRAME_BYTES);
                 }
@@ -1013,6 +1092,7 @@ fn start_hppt_transport(
                 .context("hppt TCP connect timed out")?
                 .with_context(|| format!("connect hppt server {host}:{port}"))?;
                 stream.set_nodelay(true).context("set TCP_NODELAY")?;
+                info!(server = %format!("{host}:{port}"), generation, "connected to hppt server");
                 run_hppt_generation(
                     stream,
                     StreamContext {
@@ -1052,7 +1132,12 @@ fn start_hppt_transport(
             {
                 return;
             }
-            eprintln!("hppt transport attempt {failures_count} failed; retrying in {delay} ms");
+            warn!(
+                attempt = failures_count,
+                retry_delay_ms = delay,
+                error = %error,
+                "hppt transport failed; retrying"
+            );
             time::sleep(Duration::from_millis(delay)).await;
         }
     });
@@ -1198,6 +1283,7 @@ fn start_websocket_transport(
                     .await
                     .context("websocket connect timed out")?
                     .with_context(|| format!("connect websocket {url}"))?;
+                info!(generation, "connected to websocket server");
                 run_websocket_generation(
                     socket,
                     StreamContext {
@@ -1237,8 +1323,11 @@ fn start_websocket_transport(
             {
                 return;
             }
-            eprintln!(
-                "websocket transport attempt {failures_count} failed; retrying in {delay} ms"
+            warn!(
+                attempt = failures_count,
+                retry_delay_ms = delay,
+                error = %error,
+                "websocket transport failed; retrying"
             );
             time::sleep(Duration::from_millis(delay)).await;
         }
@@ -1282,7 +1371,9 @@ where
                 let Some(frame) = outbound else {
                     bail!("outbound queue closed");
                 };
+                let frame_size = frame.len();
                 socket.send(WebSocketMessage::Binary(frame.into())).await.context("send websocket binary message")?;
+                trace!(bytes = frame_size, "sent websocket protocol frame");
                 failures.store(0, Ordering::Relaxed);
             }
             incoming = socket.next() => {
@@ -1292,6 +1383,7 @@ where
                 match incoming.context("read websocket message")? {
                     WebSocketMessage::Binary(frame) => {
                         failures.store(0, Ordering::Relaxed);
+                        trace!(bytes = frame.len(), "received websocket protocol frame");
                         queue_server_frame(events_tx, frame_budget, generation, frame.to_vec()).await?;
                     }
                     WebSocketMessage::Ping(payload) => {
@@ -1306,6 +1398,7 @@ where
             }
             _ = ping_tick.tick(), if ping_interval_millis > 0 => {
                 socket.send(WebSocketMessage::Ping(Vec::new().into())).await.context("send websocket ping")?;
+                trace!("sent websocket ping");
             }
             reason = restart_rx.recv() => {
                 bail!("transport restart requested: {}", reason.unwrap_or_else(|| "restart channel closed".to_owned()))

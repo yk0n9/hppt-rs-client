@@ -5,6 +5,7 @@ use serde::{
 };
 use std::fmt;
 use std::{collections::HashSet, fs, path::Path};
+use tracing::warn;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -144,9 +145,10 @@ impl Config {
         let config: Self = serde_yaml::from_str(&contents).context("parse YAML")?;
         for (index, forward) in config.forwards.iter().enumerate() {
             if !forward.duplicate_fields.is_empty() {
-                eprintln!(
-                    "warning: forwards[{index}] repeats {}; the last value for each field is used",
-                    forward.duplicate_fields.join(", ")
+                warn!(
+                    forward_index = index,
+                    repeated_fields = %forward.duplicate_fields.join(", "),
+                    "forward configuration contains duplicate keys; last values are used"
                 );
             }
         }
