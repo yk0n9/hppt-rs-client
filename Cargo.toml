@@ -9,9 +9,26 @@ anyhow = "1"
 base64 = "0.22"
 futures-util = "0.3"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 sha1 = "0.10"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal"] }
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
